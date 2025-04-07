@@ -12,8 +12,8 @@ import torchvision.transforms as transforms
 class DNN(nn.Module):
     def __init__(self):
         super(DNN, self).__init__()
-        self.layers = torchvision.models.resnet50(
-            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+        self.layers = torchvision.models.regnet_y_8gf(
+            weights=torchvision.models.regnet.RegNet_Y_8GF_Weights.IMAGENET1K_V2
         )
         num_of_features = self.layers.fc.in_features  # num_of_featurs = 2048 always
         self.layers.fc = nn.Sequential(

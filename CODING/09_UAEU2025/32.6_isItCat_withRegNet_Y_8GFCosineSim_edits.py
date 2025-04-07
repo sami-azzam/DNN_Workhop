@@ -13,32 +13,31 @@ class DNN(nn.Module):
     def __init__(self, num_classes=2):
         super(DNN, self).__init__()
 
-        self.layers = torchvision.models.regnet_y_8gf(
-            weights=torchvision.models.regnet.RegNet_Y_8GF_Weights.IMAGENET1K_V2
+        self.layers = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
         )
-        self.num_classes = num_classes
-        # Create learnable prototypes for each class.
-        # nn.Parameter ensures that the tensor is treated as a model parameter.
-        # torch.randn(num_classes, 1000) initializes the prototypes with random values.
-        self.prototypes = nn.Parameter(torch.randn(num_classes, 1000))
 
-        # --- Original code that replaced the output layer (commented out):
-        # num_of_features = self.layers.fc.in_features  # num_of_featurs = 2048 always
-        # self.layers.fc = nn.Sequential(
-        #     nn.Dropout(0.5),
-        #     nn.Linear(num_of_features, 1024),
-        #     nn.Dropout(0.2),
-        #     nn.Linear(1024, 512),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(512, 1),
-        #     nn.Sigmoid(),
-        # )
+        # --- Original conv1 and maxpool modifications for 32x32 images:
+        # self.layers.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        # self.layers.maxpool = nn.Identity()
+        # (These changes were kept from the previous version for 32x32 images)
+        self.layers.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.layers.maxpool = nn.Identity()
+
+        self.num_classes = num_classes
+
+        # --- Original prototype initialization:
+        # self.prototypes = nn.Parameter(torch.randn(num_classes, 1000))
+        # (Kept as-is since we still use the 1000-d output of ResNet50)
+        self.prototypes = nn.Parameter(torch.randn(num_classes, 1000))
 
     def forward(self, x):
         out = self.layers(x)
         out_norm = nn.functional.normalize(out, p=2, dim=1)
         prototypes_norm = nn.functional.normalize(self.prototypes, p=2, dim=1)
-        # Compute cosine similarity between features and prototypes.
+        # Compute cosine similarity between the normalized features and prototypes.
         cosine_sim = torch.matmul(out_norm, prototypes_norm.t())
         return cosine_sim
 
@@ -68,7 +67,6 @@ if __name__ == "__main__":
 # start of the training part
 
 
-# define a function that stores the learned result
 def save_checkpoint(model, opt, epoch, path):
     torch.save(
         {"model": model.state_dict(), "optimizer": opt.state_dict(), "epoch": epoch},
@@ -77,29 +75,29 @@ def save_checkpoint(model, opt, epoch, path):
 
 
 if __name__ == "__main__" and not done:
-    # Specify the folder to store the learned result.
+    # Specify folder for saving checkpoints.
     checkpoints_path = "./checkpoints"
     if not os.path.isdir(checkpoints_path):
         os.makedirs(checkpoints_path)
 
-    # --- Original data transformation:
-    # trans_func = transforms.Compose(
-    #     [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    # )
-    # --- New enhanced data augmentation and normalization using ImageNet stats:
+    # --- Original data transformation for 32x32 images:
+    # trans_func = transforms.Compose([
+    #     transforms.RandomCrop(32, padding=4),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    # ])
+    # --- New: Add a small random rotation (±10°) to further augment the data.
     trans_func = transforms.Compose(
         [
-            transforms.RandomResizedCrop(224),  # Crop & resize to 224x224
-            transforms.RandomHorizontalFlip(),  # Random horizontal flip
-            transforms.ColorJitter(
-                brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
-            ),  # Color jitter
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),  # New: slight rotation
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
 
-    # Load training and test datasets.
     trainset = torchvision.datasets.ImageFolder(
         root="../../DB/train_data_lowRes/", transform=trans_func
     )
@@ -108,67 +106,72 @@ if __name__ == "__main__" and not done:
     )
     testset = torchvision.datasets.ImageFolder(
         root="../../DB/test_data_lowRes/",
-        transform=trans_func,  # Use same normalization for test set
+        transform=trans_func,  # Use same transformation for test
     )
     test_batches = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False)
 
-    # --- Original loss and optimizer (for CrossEntropyLoss):
+    # --- Original loss and optimizer settings from the previous version:
     # L = nn.CrossEntropyLoss()
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # --- New: Differential learning rates (lower for backbone, higher for prototypes) and using CrossEntropyLoss:
-    L = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
+    # optimizer = torch.optim.Adam([
+    #     {"params": model.layers.parameters(), "lr": 0.0005},
+    #     {"params": model.prototypes, "lr": 0.001}
+    # ])
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    # margin = 0.35
+    # --- New: Use label smoothing in CrossEntropyLoss, AdamW with weight decay, and CosineAnnealingLR.
+    L = nn.CrossEntropyLoss(label_smoothing=0.1)  # New: label smoothing added
+    optimizer = torch.optim.AdamW(
         [
-            {
-                "params": model.layers.parameters(),
-                "lr": 0.0001,
-            },  # Lower LR for pre-trained backbone
-            {"params": model.prototypes, "lr": 0.001},  # Higher LR for new prototypes
-        ]
-    )
+            {"params": model.layers.parameters(), "lr": 0.0005},
+            {"params": model.prototypes, "lr": 0.001},
+        ],
+        weight_decay=1e-4,
+    )  # New: weight decay added
+    training_epochs = 30  # New: Increase number of epochs for better convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=training_epochs
+    )  # New: smoother LR decay
+    margin = 0.35  # Keeping the same cosine margin
 
-    # New Learning Rate Scheduler: StepLR decays LR every 5 epochs by a factor of 0.5.
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-
-    # New: Margin for cosine similarity (ArcFace-inspired)
-    margin = 0.35
-
-    # --- Original training loop for CrossEntropyLoss:
+    # --- Original training loop with StepLR and margin:
     # for epoch in range(training_epochs):
     #     total_epoch_loss = 0.0
+    #     model.train()
     #     for X, Y_label in training_batches:
     #         X = X.to(device)
     #         Y_label = Y_label.to(device).long()
     #         optimizer.zero_grad()
-    #         Y = model(X)
-    #         batch_avg_loss = L(Y, Y_label)
-    #         batch_avg_loss.backward()
+    #         logits = model(X)
+    #         mask = torch.zeros_like(logits)
+    #         mask.scatter_(1, Y_label.unsqueeze(1), 1.0)
+    #         logits_margin = logits - margin * mask
+    #         loss = L(logits_margin, Y_label)
+    #         loss.backward()
     #         optimizer.step()
-    #         total_epoch_loss += batch_avg_loss.item()
-    #         ...
-    # --- New training loop with cosine margin modification:
-    training_epochs = 15
+    #         total_epoch_loss += loss.item()
+    #     scheduler.step()
+    #     save_checkpoint(model, optimizer, epoch, checkpoints_path)
+    #     print("[Epoch:{:>3}] total_epoch_loss = {:>.9f}".format(epoch + 1, total_epoch_loss))
+    # --- New training loop: (Same margin modification applied, but with new optimizer/scheduler and more epochs)
     for epoch in range(training_epochs):
         total_epoch_loss = 0.0
-        model.train()  # Ensure model is in training mode
+        model.train()
         for X, Y_label in training_batches:
             X = X.to(device)
             Y_label = Y_label.to(device).long()
             optimizer.zero_grad()
-            logits = model(X)  # Output shape: [batch_size, num_classes]
+            logits = model(X)  # logits shape: [batch_size, num_classes]
 
-            # Apply cosine margin to the logits for the true class
-            # Create one-hot mask for labels.
+            # Apply cosine margin modification.
             mask = torch.zeros_like(logits)
             mask.scatter_(1, Y_label.unsqueeze(1), 1.0)
-            # Modify logits: subtract margin from the true class logits.
             logits_margin = logits - margin * mask
-
             loss = L(logits_margin, Y_label)
+
             loss.backward()
             optimizer.step()
             total_epoch_loss += loss.item()
-        scheduler.step()  # Step the LR scheduler after each epoch
+        scheduler.step()  # CosineAnnealingLR updates at the end of each epoch
         save_checkpoint(model, optimizer, epoch, checkpoints_path)
         print(
             "[Epoch:{:>3}] total_epoch_loss = {:>.9f}".format(
@@ -177,21 +180,10 @@ if __name__ == "__main__" and not done:
         )
     # end of the training loop
 
-    # --- Original test segment for CrossEntropyLoss:
-    # with torch.no_grad():
-    #     model.eval()
-    #     for X_forTest, Y_label_forTest in test_batches:
-    #         X_forTest = X_forTest.to(device)
-    #         Y_label_forTest = Y_label_forTest.to(device).long()
-    #         logits = model(X_forTest)
-    #         predicted = torch.argmax(logits, dim=1)
-    #         total += Y_label_forTest.size(0)
-    #         N_correct += (predicted == Y_label_forTest).sum().item()
-    # --- New test segment remains largely unchanged:
     N_correct = 0
     total = 0
     with torch.no_grad():
-        model.eval()  # Set model to evaluation mode
+        model.eval()
         for X_forTest, Y_label_forTest in test_batches:
             X_forTest = X_forTest.to(device)
             Y_label_forTest = Y_label_forTest.to(device).long()
